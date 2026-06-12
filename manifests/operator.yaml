@@ -76,7 +76,7 @@ spec:
             - name: LOG_TAIL_LINES
               value: "15"
             - name: EXCLUDED_NAMESPACES
-              value: "kube-system,kube-public,kube-node-lease,default,argocd,cert-manager,cilium-test-*,doks-cost-enforcer-system,envoy-gateway-system,gadget,goldilocks,infisical,langfuse,linkerd,linkerd-viz,monitoring,observability,osiris-system,portainer,vault,velero,vpa-system,centrifugo,crashguard"
+              value: "kube-system,kube-public,kube-node-lease"
             - name: SLACK_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
