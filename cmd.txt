@@ -1,8 +1,8 @@
-kubectl create secret generic crashguard-secrets \                                                                                                                   [17:47:46]
-  --namespace crashguard \
-  --from-literal=SLACK_WEBHOOK_URL="' \
+kubectl create secret generic crashguard-secrets \
+  --namespace=crashguard \
+  --from-literal=SLACK_WEBHOOK_URL="" \
   --dry-run=client -o yaml | \
 kubeseal \
-  --controller-namespace vault \
-  --controller-name sealed-secrets \
-  --format yaml > manifests/sealed-secret.yaml
+  --controller-namespace=vault \
+  --controller-name=sealed-secrets \
+  --format=yaml > manifests/sealed-secret.yaml
