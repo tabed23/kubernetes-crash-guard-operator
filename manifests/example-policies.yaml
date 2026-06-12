@@ -1,0 +1,21 @@
+# Per-namespace overrides. Apply only in namespaces that need
+# non-default behavior — everything else uses the env defaults.
+
+# Critical service: revert fast (5 min)
+apiVersion: crashguard.io/v1alpha1
+kind: CrashLoopPolicy
+metadata:
+  name: policy
+  namespace: 
+spec:
+  thresholdMinutes: 5
+  autoRollback: true
+---
+# Alert only — never auto-rollback in this namespace
+apiVersion: crashguard.io/v1alpha1
+kind: CrashLoopPolicy
+metadata:
+  name: policy
+  namespace: 
+spec:
+  autoRollback: false

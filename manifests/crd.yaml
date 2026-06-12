@@ -1,0 +1,39 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: crashlooppolicies.crashguard.io
+spec:
+  group: crashguard.io
+  scope: Namespaced
+  names:
+    plural: crashlooppolicies
+    singular: crashlooppolicy
+    kind: CrashLoopPolicy
+    shortNames: [clp]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                thresholdMinutes:
+                  type: integer
+                  description: Minutes of CrashLoopBackOff before rollback.
+                autoRollback:
+                  type: boolean
+                  description: Allow auto-rollback in this namespace.
+                minRevisionsForRollback:
+                  type: integer
+                  description: Revision history required to allow rollback.
+      additionalPrinterColumns:
+        - name: Threshold(min)
+          type: integer
+          jsonPath: .spec.thresholdMinutes
+        - name: AutoRollback
+          type: boolean
+          jsonPath: .spec.autoRollback
