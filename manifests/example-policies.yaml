@@ -1,21 +1,55 @@
-# Per-namespace overrides. Apply only in namespaces that need
-# non-default behavior — everything else uses the env defaults.
+# Apply to any namespace to enable monitoring.
+# kubectl apply -f this-file.yaml
+# kubectl get clp --all-namespaces
+# kubectl delete clp policy -n <namespace>   <- disables monitoring
 
-# Critical service: revert fast (5 min)
+# critical — fast rollback
 apiVersion: crashguard.io/v1alpha1
 kind: CrashLoopPolicy
 metadata:
   name: policy
-  namespace: 
+  namespace: payment-gateway
 spec:
   thresholdMinutes: 5
   autoRollback: true
+  minRevisionsForRollback: 3
 ---
-# Alert only — never auto-rollback in this namespace
 apiVersion: crashguard.io/v1alpha1
 kind: CrashLoopPolicy
 metadata:
   name: policy
-  namespace: 
+  namespace: commercial
 spec:
+  thresholdMinutes: 10
+  autoRollback: true
+  minRevisionsForRollback: 3
+---
+apiVersion: crashguard.io/v1alpha1
+kind: CrashLoopPolicy
+metadata:
+  name: policy
+  namespace: internal
+spec:
+  thresholdMinutes: 10
+  autoRollback: true
+  minRevisionsForRollback: 3
+---
+apiVersion: crashguard.io/v1alpha1
+kind: CrashLoopPolicy
+metadata:
+  name: policy
+  namespace: strapi
+spec:
+  thresholdMinutes: 10
   autoRollback: false
+  minRevisionsForRollback: 3
+---
+apiVersion: crashguard.io/v1alpha1
+kind: CrashLoopPolicy
+metadata:
+  name: policy
+  namespace: agent
+spec:
+  thresholdMinutes: 10
+  autoRollback: false
+  minRevisionsForRollback: 3
