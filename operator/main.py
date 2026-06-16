@@ -1,30 +1,38 @@
 """
-CrashGuard v3.0 — cluster-wide CrashLoopBackOff detection, Slack alerts with
-reason + logs, conditional auto-rollback, and per-namespace policy via CRD.
+CrashGuard v3.1 — namespace-opted CrashLoopBackOff detection.
 
-Config resolution per namespace (highest priority first):
-  1. CrashLoopPolicy object in that namespace (CRD, optional)
-  2. Operator env vars (defaults)
+The operator watches all namespaces BUT only acts on namespaces that have
+a CrashLoopPolicy object applied. No policy = completely ignored.
 
-Rollback rule: only if the Deployment has at least min_revisions revisions in
-history (default 3 = current + 2 previous). Target = immediately previous
-revision. Less history -> alert only.
+To enable a namespace:
+  kubectl apply -f - <<EOF
+  apiVersion: crashguard.io/v1alpha1
+  kind: CrashLoopPolicy
+  metadata:
+    name: policy
+    namespace: my-namespace
+  spec:
+    thresholdMinutes: 10
+    autoRollback: true
+    minRevisionsForRollback: 3
+  EOF
+
+To disable a namespace:
+  kubectl delete clp policy -n my-namespace
 
 Slack flow per incident:
   1. :rotating_light: CrashLoopBackOff detected (reason + logs)
   2. :hourglass_flowing_sand: Rolling back now
   3. :leftwards_arrow_with_hook: Auto-rollback executed
 
-- Event-driven, read-only on pods (no finalizers, no patches on pods).
-- Watches ALL namespaces (kopf --all-namespaces), minus EXCLUDED_NAMESPACES.
-
-Env (global defaults):
+Env (global defaults, overridden per namespace by CrashLoopPolicy):
   SLACK_WEBHOOK_URL            Slack incoming webhook
-  EXCLUDED_NAMESPACES          comma-separated, wildcards ok (e.g. cilium-test-*)
-  CRASH_THRESHOLD_MINUTES      minutes of crashloop before rollback (default 10)
+  CRASH_THRESHOLD_MINUTES      minutes before rollback (default 10)
   AUTO_ROLLBACK                "true"/"false" (default true)
-  MIN_REVISIONS_FOR_ROLLBACK   revisions required to allow rollback (default 3)
-  LOG_TAIL_LINES               log lines in the alert (default 15)
+  MIN_REVISIONS_FOR_ROLLBACK   revisions required (default 3)
+  LOG_TAIL_LINES               log lines in alert (default 15)
+  STARTUP_GRACE_SECONDS        silence period on startup (default 120)
+  ALERT_COOLDOWN_SECONDS       seconds between repeat alerts (default 900)
 
 Per-Deployment annotation:
   crashguard.io/skip: "true"   -> alert only, never roll back this deployment
@@ -33,7 +41,6 @@ Per-Deployment annotation:
 import os
 import re
 import time
-import fnmatch
 import logging
 
 import kopf
@@ -45,7 +52,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("crashguard")
 
 # ---------------------------------------------------------------------------
-# Global defaults (overridable per namespace via CrashLoopPolicy)
+# Config
 # ---------------------------------------------------------------------------
 
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -53,21 +60,13 @@ LOG_TAIL_LINES = int(os.environ.get("LOG_TAIL_LINES", "15"))
 THRESHOLD_MINUTES = float(os.environ.get("CRASH_THRESHOLD_MINUTES", "10"))
 AUTO_ROLLBACK = os.environ.get("AUTO_ROLLBACK", "true").lower() == "true"
 MIN_REVISIONS_FOR_ROLLBACK = int(os.environ.get("MIN_REVISIONS_FOR_ROLLBACK", "3"))
-
-EXCLUDED_NAMESPACES = [
-    p.strip()
-    for p in os.environ.get(
-        "EXCLUDED_NAMESPACES",
-        "kube-system,kube-public,kube-node-lease",
-    ).split(",")
-    if p.strip()
-]
+STARTUP_GRACE_SECONDS = int(os.environ.get("STARTUP_GRACE_SECONDS", "120"))
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))
 
 ANN_SKIP = "crashguard.io/skip"
 ANN_ROLLED_BACK = "crashguard.io/rolled-back-at"
-ROLLBACK_COOLDOWN_SECONDS = 3600   # never roll the same deployment twice within 1h
-ALERT_COOLDOWN_SECONDS = 900       # 1 alert per DEPLOYMENT per 15 min
-POLICY_CACHE_TTL = 60              # seconds to cache CrashLoopPolicy lookups
+ROLLBACK_COOLDOWN_SECONDS = 3600
+POLICY_CACHE_TTL = 60
 
 # ---------------------------------------------------------------------------
 # Kubernetes clients
@@ -84,12 +83,13 @@ custom_api = kubernetes.client.CustomObjectsApi()
 api_client = ApiClient()
 
 # ---------------------------------------------------------------------------
-# In-memory state
+# State
 # ---------------------------------------------------------------------------
 
-crash_tracker = {}   # {(ns, pod): first_seen_ts}
-alerted = {}         # {alert_key: last_alert_ts}
-_policy_cache = {}   # {ns: (policy_dict, fetched_at)}
+STARTUP_TIME = None
+crash_tracker = {}
+alerted = {}
+_policy_cache = {}
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -107,41 +107,48 @@ EXIT_CODE_MEANINGS = {
 }
 
 
-def namespace_excluded(namespace: str) -> bool:
-    return any(fnmatch.fnmatch(namespace, pattern) for pattern in EXCLUDED_NAMESPACES)
-
-
 # ---------------------------------------------------------------------------
-# Per-namespace policy (CrashLoopPolicy CRD, optional)
+# Policy — None means namespace is not opted in
 # ---------------------------------------------------------------------------
 
-def get_policy(namespace: str) -> dict:
-    """Settings for a namespace: its CrashLoopPolicy if one exists, else env defaults."""
+def get_policy(namespace: str):
+    """
+    Returns policy dict if a CrashLoopPolicy exists in this namespace.
+    Returns None if no policy — namespace is completely ignored.
+    """
     now = time.time()
     cached = _policy_cache.get(namespace)
     if cached and now - cached[1] < POLICY_CACHE_TTL:
         return cached[0]
 
-    spec = {}
+    policy = None
     try:
         items = custom_api.list_namespaced_custom_object(
             group="crashguard.io", version="v1alpha1",
             namespace=namespace, plural="crashlooppolicies",
         ).get("items", [])
+
         if items:
             spec = items[0].get("spec", {}) or {}
             if len(items) > 1:
                 log.warning("Multiple CrashLoopPolicies in %s — using '%s'",
                             namespace, items[0]["metadata"]["name"])
-    except kubernetes.client.exceptions.ApiException:
-        pass  # CRD not installed / no permission -> env defaults
+            policy = {
+                "threshold_minutes": float(
+                    spec.get("thresholdMinutes", THRESHOLD_MINUTES)),
+                "auto_rollback": bool(
+                    spec.get("autoRollback", AUTO_ROLLBACK)),
+                "min_revisions": int(
+                    spec.get("minRevisionsForRollback",
+                             MIN_REVISIONS_FOR_ROLLBACK)),
+            }
+            log.debug("Policy found for %s: %s", namespace, policy)
+        else:
+            log.debug("No CrashLoopPolicy in %s — namespace ignored", namespace)
 
-    policy = {
-        "threshold_minutes": float(spec.get("thresholdMinutes", THRESHOLD_MINUTES)),
-        "auto_rollback": bool(spec.get("autoRollback", AUTO_ROLLBACK)),
-        "min_revisions": int(spec.get("minRevisionsForRollback",
-                                      MIN_REVISIONS_FOR_ROLLBACK)),
-    }
+    except kubernetes.client.exceptions.ApiException:
+        pass
+
     _policy_cache[namespace] = (policy, now)
     return policy
 
@@ -160,16 +167,16 @@ def send_slack(text: str):
         log.error("Slack post failed: %s", e)
 
 
-def once_per_cooldown(key, cooldown=ALERT_COOLDOWN_SECONDS) -> bool:
+def once_per_cooldown(key) -> bool:
     now = time.time()
-    if now - alerted.get(key, 0) > cooldown:
+    if now - alerted.get(key, 0) > ALERT_COOLDOWN_SECONDS:
         alerted[key] = now
         return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# Crash info helpers
+# Crash info
 # ---------------------------------------------------------------------------
 
 def get_crash_reason(cs: dict) -> dict:
@@ -220,12 +227,10 @@ def find_owning_deployment(namespace: str, pod_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Conditional rollback
+# Rollback
 # ---------------------------------------------------------------------------
 
 def get_previous_replicaset(namespace: str, deploy_name: str, min_revisions: int):
-    """Return (current_rev, prev_rev, prev_rs) if the deployment has at least
-    `min_revisions` revisions in history. Otherwise None -> no rollback."""
     owned = []
     for rs in apps_v1.list_namespaced_replica_set(namespace).items:
         for o in rs.metadata.owner_references or []:
@@ -234,10 +239,8 @@ def get_previous_replicaset(namespace: str, deploy_name: str, min_revisions: int
                     "deployment.kubernetes.io/revision", "0"))
                 owned.append((rev, rs))
     owned.sort(key=lambda t: t[0])
-
     if len(owned) < min_revisions:
         return None
-
     return owned[-1][0], owned[-2][0], owned[-2][1]
 
 
@@ -246,13 +249,15 @@ def rollback_deployment(namespace: str, deploy_name: str, policy: dict) -> bool:
     anns = deploy.metadata.annotations or {}
 
     if anns.get(ANN_SKIP) == "true":
-        log.info("Skip annotation set on %s/%s — not rolling back", namespace, deploy_name)
+        log.info("Skip annotation on %s/%s — not rolling back",
+                 namespace, deploy_name)
         return False
 
     if ANN_ROLLED_BACK in anns:
         try:
             if time.time() - float(anns[ANN_ROLLED_BACK]) < ROLLBACK_COOLDOWN_SECONDS:
-                log.info("%s/%s already rolled back within cooldown", namespace, deploy_name)
+                log.info("%s/%s already rolled back within cooldown",
+                         namespace, deploy_name)
                 return False
         except ValueError:
             pass
@@ -266,18 +271,16 @@ def rollback_deployment(namespace: str, deploy_name: str, policy: dict) -> bool:
     current_rev, prev_rev, prev_rs = prev
     prev_images = ", ".join(c.image for c in prev_rs.spec.template.spec.containers)
 
-    # --- announce BEFORE doing it ------------------------------------------
-    log.info("Rolling back %s/%s now (rev %s -> %s)...",
+    log.info("Rolling back %s/%s (rev %s -> %s)...",
              namespace, deploy_name, current_rev, prev_rev)
     send_slack(
         f":hourglass_flowing_sand: *Rolling back now*\n"
         f"*Deployment:* `{namespace}/{deploy_name}`\n"
-        f"CrashLoopBackOff persisted for {policy['threshold_minutes']:.0f}+ minutes — "
-        f"reverting revision {current_rev} → {prev_rev} "
+        f"CrashLoopBackOff persisted for {policy['threshold_minutes']:.0f}+ "
+        f"minutes — reverting revision {current_rev} → {prev_rev} "
         f"(image: `{prev_images}`)."
     )
 
-    # --- do it ----------------------------------------------------------------
     template = api_client.sanitize_for_serialization(prev_rs.spec.template)
     template.get("metadata", {}).get("labels", {}).pop("pod-template-hash", None)
 
@@ -287,8 +290,8 @@ def rollback_deployment(namespace: str, deploy_name: str, policy: dict) -> bool:
     }
     apps_v1.patch_namespaced_deployment(deploy_name, namespace, patch)
 
-    log.info("ROLLED BACK %s/%s: revision %s -> %s", namespace, deploy_name,
-             current_rev, prev_rev)
+    log.info("ROLLED BACK %s/%s: revision %s -> %s",
+             namespace, deploy_name, current_rev, prev_rev)
     send_slack(
         f":leftwards_arrow_with_hook: *Auto-rollback executed*\n"
         f"*Deployment:* `{namespace}/{deploy_name}`\n"
@@ -300,16 +303,24 @@ def rollback_deployment(namespace: str, deploy_name: str, policy: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main handler — event-driven, fires on every pod status change
+# Main handler
 # ---------------------------------------------------------------------------
 
 @kopf.on.event("v1", "pods")
 def check_pod(namespace, name, status, event, **_):
-    if namespace_excluded(namespace):
+
+    # startup grace period — ignore everything on first scan
+    if STARTUP_TIME and time.time() - STARTUP_TIME < STARTUP_GRACE_SECONDS:
         return
 
+    # pod deleted — clean up state
     if event.get("type") == "DELETED":
         crash_tracker.pop((namespace, name), None)
+        return
+
+    # namespace opted in? no policy = not monitored
+    policy = get_policy(namespace)
+    if policy is None:
         return
 
     container_statuses = (status or {}).get("containerStatuses") or []
@@ -325,12 +336,10 @@ def check_pod(namespace, name, status, event, **_):
         first_seen = crash_tracker.setdefault(key, now)
         minutes = (now - first_seen) / 60.0
 
-        policy = get_policy(namespace)
         deploy_name = find_owning_deployment(namespace, name)
         container = cs.get("name", "?")
         restarts = cs.get("restartCount", 0)
 
-        # Rollback only possible per this namespace's policy + enough history
         can_rollback = (
             policy["auto_rollback"]
             and deploy_name is not None
@@ -338,11 +347,12 @@ def check_pod(namespace, name, status, event, **_):
                 namespace, deploy_name, policy["min_revisions"]) is not None
         )
 
-        # --- alert: deduped per DEPLOYMENT ----------------------------------
+        # alert
         if once_per_cooldown((namespace, deploy_name or name)):
             why = get_crash_reason(cs)
             logs = get_last_logs(namespace, name, container)
-            log.info("CrashLoopBackOff: %s/%s deploy=%s restarts=%s reason=%s exit=%s",
+            log.info("CrashLoopBackOff: %s/%s deploy=%s restarts=%s "
+                     "reason=%s exit=%s",
                      namespace, name, deploy_name, restarts,
                      why["reason"], why["exit_code"])
             rollback_note = ""
@@ -362,21 +372,26 @@ def check_pod(namespace, name, status, event, **_):
                 f"{rollback_note}"
             )
 
-        # --- rollback after this namespace's threshold ------------------------
+        # rollback
         if can_rollback and minutes >= policy["threshold_minutes"]:
             try:
                 if rollback_deployment(namespace, deploy_name, policy):
                     crash_tracker.pop(key, None)
             except Exception as e:
                 log.exception("Rollback failed for %s/%s", namespace, deploy_name)
-                send_slack(f":x: Rollback FAILED for `{namespace}/{deploy_name}`: {e}")
+                send_slack(
+                    f":x: Rollback FAILED for `{namespace}/{deploy_name}`: {e}")
 
 
 @kopf.on.startup()
 def startup(settings: kopf.OperatorSettings, **_):
+    global STARTUP_TIME
     settings.posting.enabled = False
-    log.info("CrashGuard v3.0 started — defaults: threshold=%s min, auto_rollback=%s, "
-             "min_revisions=%s, excluded=%s (per-namespace CrashLoopPolicy overrides "
-             "supported)",
-             THRESHOLD_MINUTES, AUTO_ROLLBACK, MIN_REVISIONS_FOR_ROLLBACK,
-             EXCLUDED_NAMESPACES)
+    STARTUP_TIME = time.time()
+    log.info(
+        "CrashGuard v3.1 started — grace=%ss, threshold=%s min, "
+        "auto_rollback=%s, min_revisions=%s, alert_cooldown=%ss. "
+        "Monitoring OPTED-IN namespaces only (apply CrashLoopPolicy to enable).",
+        STARTUP_GRACE_SECONDS, THRESHOLD_MINUTES, AUTO_ROLLBACK,
+        MIN_REVISIONS_FOR_ROLLBACK, ALERT_COOLDOWN_SECONDS,
+    )
