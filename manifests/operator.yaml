@@ -63,9 +63,11 @@ spec:
       labels: { app: crashguard }
     spec:
       serviceAccountName: crashguard
+      imagePullSecrets:
+        - name: vag
       containers:
         - name: operator
-          image: YOUR_REGISTRY/crashguard:v3   # <-- change me
+          image: crashguard:latest
           env:
             - name: CRASH_THRESHOLD_MINUTES
               value: "10"
@@ -75,8 +77,10 @@ spec:
               value: "3"
             - name: LOG_TAIL_LINES
               value: "15"
-            - name: EXCLUDED_NAMESPACES
-              value: "kube-system,kube-public,kube-node-lease"
+            - name: STARTUP_GRACE_SECONDS
+              value: "120"
+            - name: ALERT_COOLDOWN_SECONDS
+              value: "900"
             - name: SLACK_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
